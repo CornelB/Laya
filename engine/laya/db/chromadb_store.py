@@ -250,8 +250,8 @@ async def connect_chromadb_background() -> None:
     try:
         await asyncio.to_thread(connect_chromadb)
     except Exception as e:
-        # Previously this aborted engine startup; now it only disables vector
-        # search (waiters stop waiting and get the usual RuntimeError).
+        # A connect failure disables vector search rather than stopping the
+        # engine: waiters stop waiting and get the usual RuntimeError.
         log.error("chromadb_connect_failed", error=str(e))
     finally:
         _connecting = False
@@ -285,6 +285,17 @@ def is_chromadb_healthy() -> bool:
         return True
     except Exception:
         return False
+
+
+def get_chromadb_status() -> str:
+    """Status for /health: "starting", "healthy" or "unhealthy".
+
+    "starting" covers the background connect window, so the UI can tell a
+    store that is still coming up from one that failed.
+    """
+    if _collection is None and _connecting:
+        return "starting"
+    return "healthy" if is_chromadb_healthy() else "unhealthy"
 
 
 async def embed_document(

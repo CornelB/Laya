@@ -60,3 +60,45 @@ async def test_wait_for_collection_does_not_wait_when_not_connecting(monkeypatch
     monkeypatch.setattr(chromadb_store, "_collection", None)
     with pytest.raises(RuntimeError):
         await chromadb_store.wait_for_collection()
+
+
+def test_status_is_starting_while_connect_in_flight(monkeypatch):
+    from laya.db import chromadb_store
+
+    monkeypatch.setattr(chromadb_store, "_collection", None)
+    monkeypatch.setattr(chromadb_store, "_connecting", True)
+    assert chromadb_store.get_chromadb_status() == "starting"
+
+
+def test_status_is_unhealthy_when_not_connected_and_not_connecting(monkeypatch):
+    from laya.db import chromadb_store
+
+    monkeypatch.setattr(chromadb_store, "_collection", None)
+    monkeypatch.setattr(chromadb_store, "_connecting", False)
+    assert chromadb_store.get_chromadb_status() == "unhealthy"
+
+
+def test_status_is_healthy_once_connected(monkeypatch):
+    from laya.db import chromadb_store
+
+    class _Collection:
+        def count(self) -> int:
+            return 0
+
+    monkeypatch.setattr(chromadb_store, "_collection", _Collection())
+    monkeypatch.setattr(chromadb_store, "_connecting", False)
+    assert chromadb_store.get_chromadb_status() == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_status_is_unhealthy_after_failed_background_connect(monkeypatch):
+    from laya.db import chromadb_store
+
+    def boom():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(chromadb_store, "connect_chromadb", boom)
+    monkeypatch.setattr(chromadb_store, "_collection", None)
+
+    await chromadb_store.connect_chromadb_background()
+    assert chromadb_store.get_chromadb_status() == "unhealthy"
