@@ -928,7 +928,7 @@ async def agent_env(db):
         p(patch(f"{ec}.write_entity_context_file", new=AsyncMock()))
         p(patch(f"{ec}.get_entity_research_dir", new=MagicMock(return_value="/tmp/research/ent")))
         p(patch(f"{ec}.build_entity_agent_prompt", new=MagicMock(return_value="PROMPT")))
-        p(patch("laya.workers.engineer.resolve_repo_path", new=AsyncMock(return_value=(None, []))))
+        p(patch("laya.workers.engineer.resolve_entity_repo_path", new=AsyncMock(return_value=(None, []))))
         p(patch("laya.config.load_repos", new=MagicMock(return_value={"repos": []})))
         p(patch("laya.api.cards_api._stream_entity_agent", new=MagicMock()))
         p(patch("laya.tasks.create_task", new=MagicMock()))
@@ -965,6 +965,30 @@ class TestRunAgentReuse:
         agent_env.resume.assert_awaited_once()
         assert agent_env.resume.await_args.args[0] == "sess_old"
         agent_env.start.assert_not_awaited()
+
+    async def test_resume_with_prompt_template_keeps_context_reminder(self, db, agent_env):
+        """A rule prompt is sent on resume together with the CONTEXT.md reminder (issue #43)."""
+        await insert_test_card(db, "card_a", "evt_a", entity_id=ENTITY)
+        agent_env.get_session.return_value = {"session_id": "sess_old", "status": "completed"}
+
+        action = RunEntityAgentAction(prompt_template="Check the failing build for {{entity_id}}")
+        result = await _exec_run_agent(action, ENTITY, {"entity_id": ENTITY})
+
+        assert result["resumed"] is True
+        resume_text = agent_env.resume.await_args.args[1]
+        assert resume_text.startswith(f"Check the failing build for {ENTITY}")
+        assert "CONTEXT.md" in resume_text
+
+    async def test_resume_without_prompt_uses_default_reminder(self, db, agent_env):
+        """With no rule prompt the resume text is the default continue + CONTEXT.md reminder."""
+        await insert_test_card(db, "card_a", "evt_a", entity_id=ENTITY)
+        agent_env.get_session.return_value = {"session_id": "sess_old", "status": "completed"}
+
+        await _exec_run_agent(RunEntityAgentAction(), ENTITY, {})
+
+        resume_text = agent_env.resume.await_args.args[1]
+        assert resume_text.startswith("Continue working.")
+        assert "CONTEXT.md" in resume_text
 
     async def test_running_session_is_skipped(self, db, agent_env):
         """An actively running agent is left alone."""

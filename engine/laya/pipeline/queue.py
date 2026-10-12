@@ -18,6 +18,7 @@ import structlog
 from laya.config import get_debounce_config, load_settings
 from laya.db.sqlite import get_db
 from laya.db.timeutil import db_now, db_ts
+from laya.models.card import PROCESSING_PLACEHOLDER_SUMMARY
 from laya.models.event import LayaEvent
 
 log = structlog.get_logger()
@@ -112,6 +113,46 @@ async def enqueue_event(event_id: str) -> None:
         (event_id,),
     )
     await db.commit()
+
+
+async def requeue_dead_events(
+    event_ids: list[str] | None = None, *, all_dead: bool = False
+) -> int:
+    """Put dead events back on the queue for a fresh retry cycle.
+
+    Only rows whose processing_status is 'dead' are touched, so an event that
+    is queued, retrying, processing or already completed is left alone. The
+    attempt counter is reset to 0 so the consumer gives the event its full
+    automatic retry budget again, and manual_retries is bumped for the Audit
+    page. Pass ``all_dead=True`` to requeue every dead event (the Audit tab's
+    bulk action) or ``event_ids`` for specific ones. Returns how many rows
+    were requeued.
+    """
+    db = await get_db()
+    reset = """SET processing_status = 'queued',
+                   processing_attempts = 0,
+                   last_error = NULL,
+                   next_retry_at = NULL,
+                   manual_retries = manual_retries + 1"""
+    if all_dead:
+        cursor = await db.execute(
+            f"UPDATE events {reset} WHERE processing_status = 'dead'"
+        )
+    elif event_ids:
+        placeholders = ",".join("?" for _ in event_ids)
+        cursor = await db.execute(
+            f"""UPDATE events {reset}
+                WHERE processing_status = 'dead'
+                  AND event_id IN ({placeholders})""",
+            tuple(event_ids),
+        )
+    else:
+        return 0
+    await db.commit()
+    retried = cursor.rowcount
+    if retried:
+        log.info("dead_events_retried", count=retried, bulk=all_dead)
+    return retried
 
 
 async def _claim_event(event_id: str) -> bool:
@@ -400,10 +441,10 @@ async def _run_workers_pipeline(
         db = await get_db()
         await db.execute(
             """UPDATE action_cards SET
-               status='pending', header=?, summary='Researching\u2026',
+               status='pending', header=?, summary=?,
                failed_stage=NULL, updated_at=CURRENT_TIMESTAMP
                WHERE card_id=?""",
-            (event.subject.title, card_id),
+            (event.subject.title, PROCESSING_PLACEHOLDER_SUMMARY, card_id),
         )
         await db.commit()
         await manager.broadcast(
@@ -412,7 +453,7 @@ async def _run_workers_pipeline(
                 "card_id": card_id,
                 "payload": {
                     "header": event.subject.title,
-                    "summary": "Researching\u2026",
+                    "summary": PROCESSING_PLACEHOLDER_SUMMARY,
                     "status": "pending",
                 },
             }
@@ -439,7 +480,7 @@ async def _run_workers_pipeline(
                 router_output.persona.value,
                 router_output.category.value,
                 event.subject.title,
-                "Researching\u2026",
+                PROCESSING_PLACEHOLDER_SUMMARY,
                 "pending",
                 2,
                 False,
@@ -456,7 +497,7 @@ async def _run_workers_pipeline(
                 "card_id": card_id,
                 "payload": {
                     "header": event.subject.title,
-                    "summary": "Researching\u2026",
+                    "summary": PROCESSING_PLACEHOLDER_SUMMARY,
                     "priority": router_output.priority.value,
                     "persona": router_output.persona.value,
                     "category": router_output.category.value,

@@ -18,6 +18,10 @@ scripts/dev.sh
 # Run engine standalone (for backend-only work)
 cd engine && source .venv/bin/activate && python -m laya.main
 
+# Engine + UI in a plain browser (no Tauri shell): give both sides one token.
+# Put VITE_LAYA_ENGINE_TOKEN=<token> in ui/.env.local, then:
+cd engine && source .venv/bin/activate && LAYA_ENGINE_TOKEN=<token> python -m laya.main
+
 # Run tests
 cd engine && source .venv/bin/activate && pytest
 
@@ -99,19 +103,38 @@ Supporting pipelines (triggered separately):
 
 - **Svelte 5 runes only**: Use `$state`, `$derived`, `$effect` — never `$:` reactive declarations
 - **Async everywhere in engine**: All DB access, HTTP, and pipeline functions are async
-- **SQLite migrations**: Numbered files in `engine/laya/db/migrations/` (001-071). New migrations get the next number. Migration runner in `db/migrate.py` applies on startup.
+- **SQLite migrations**: Numbered files in `engine/laya/db/migrations/` (001-073). New migrations get the next number. Migration runner in `db/migrate.py` applies on startup.
 - **Multi-statement invariants**: Laya uses ONE shared aiosqlite connection (no per-request isolation). For a sequence of writes that must land atomically, wrap them in the `db/sqlite.transaction()` async context manager (a module `asyncio.Lock` + commit-on-success / rollback-on-failure). It's applied to the low-frequency off-hot-path invariants (space delete, card cascade delete, context-group merge/unlink); deliberately NOT the hot `_persist_card` emit path.
 - **Hybrid search / FTS5**: Chat and trace retrieval combine vector search (ChromaDB) with lexical BM25 search over SQLite FTS5 virtual tables (`cards_fts`, `events_fts`), merged via Reciprocal Rank Fusion. FTS tables are built at startup and kept in sync by SQL triggers (`db/fts.py`); retrieval degrades to `LIKE` if the SQLite build lacks FTS5. The `action_cards.thread_context` column (a short thread blurb persisted at emit time) is indexed so terse follow-up cards ("Approved.") stay findable by their thread's keywords ("Contextual BM25"). Shared retrieval primitives live in `laya/retrieval.py` — `extract_keywords` (+ `STOPWORDS`), `reciprocal_rank_fusion`, and `fts_or_like` (the try-FTS-then-fall-back-to-LIKE dispatch). The chat/trace/card-search stacks all call these; don't re-implement per-stack (they had drifted — P7-1).
 - **LLM prompts**: Organized by role in `engine/laya/llm/prompts/` (router, stager, engineer, comms, ops, sales, hr, finance, chat, omni, briefing, group_summary, research, overrides, trace_filter, context_learner, context_rule_consolidator, classification_rule_consolidator, etc.). **Gate conditional content by platform/intent instead of always-including it** (token cost matters on small local windows): `build_router_system_prompt(platforms)` / `build_stager_system_prompt(platform)` assemble only the relevant platform lifecycle blocks, and `llm/tools/definitions.select_chat_tools()` ships only the keyword-relevant chat tool groups. Follow this when adding new conditional blocks (P6).
 - **Agent inference backends**: `llm_call()` accepts model ids of the form `agent/<agent_id>/<model>` (agent_id ∈ claude_code, codex_cli, gemini_cli, pi_cli) to run a stage on an installed CLI agent's own quota. Claude Code is the "native" tier (schema enforced via `--json-schema`); others are "best-effort" (schema injected as text + parse/validate/retry). Agents run headless in an ephemeral cwd with tools denied; usage is metered against window-based limits by `agent_budget.py`.
+- **Engine REST auth**: Every REST router except `/health` requires `Authorization: Bearer <token>` (`security/engine_auth.py`, applied via `include_router(..., dependencies=...)` in `main.py`). The Tauri shell generates the token per launch (`engine_token()` in `src-tauri/src/lib.rs`), passes it to the engine as `LAYA_ENGINE_TOKEN`, exposes it to the app's own origins through an origin-guarded init script (`window.__LAYA_ENGINE_TOKEN__`), and uses it for its tray polling. The engine removes the variable from its environment after reading it; with no variable set (standalone engine) it falls back to a keychain token. All UI calls go through `engineFetch`/`request` in `lib/api/engine.ts` — never a raw `fetch` to the engine. The OAuth callback is exempt; `/ws` is not yet authenticated.
+- **n8n → engine auth**: the bundled workflows present a second, separate token (`security/n8n_auth.py`, header `X-Laya-N8n-Token`). The shell mints it per launch (`n8n_token()` in `lib.rs`) and sets `LAYA_N8N_TOKEN` on both the engine (popped at startup by `keychain.ensure_n8n_token`) and n8n (read by nodes via `$env.LAYA_N8N_TOKEN`). It is accepted only on the four routes the workflows call (`N8N_ROUTES` in `engine_auth.py`: `POST /events`, `POST /ingestion-errors`, `GET /repos`, `GET /metadata/{key}`), which take either credential. Enforcement is staged in settings.json `n8n_auth.mode`: `log` (missing token is logged and counted, request proceeds) until `evaluate_readiness()` sees the token came from the launcher, the error handler and every cloned ingestion template are at their bundled versions, and no `sources` row has `workflow_update_error`; then `enforce`, never auto-reverted. Session hatch `LAYA_N8N_AUTH=off`. Every node that calls the engine must carry the header (guarded by `tests/test_workflow_templates.py`). Per-clone push failures live on `sources.workflow_update_error` with a manual `POST /sources/{id}/update-workflow`; design in `engine/docs/n8n-engine-auth.md`.
 - **Config files**: User settings live in `~/.laya/` (settings.json, team.json, rules.json, repos.json). API keys stored in OS keychain via `security/keychain.py`.
 - **Logging**: `logging_setup.py` resolves the engine log level from `LAYA_LOG_LEVEL` env var → settings.json `logging.level` → `INFO` (`resolve_log_level()`); the UI (Settings → Data) calls `apply_log_level()` via the settings API to re-level the running process without a restart. In the packaged app (non-tty stdout) the console handler is pinned to WARNING to avoid double-writing every record into the Rust-captured `engine-stdout.log`. Both Rust-captured logs (`engine-stdout.log`, `n8n.log`) are size-capped/rotated by `src-tauri/src/rotating_log.rs` (mirrors the Python `RotatingFileHandler` policy).
 - **Test fixtures**: `engine/tests/conftest.py` provides `db` (in-memory SQLite with all migrations), `sample_event`, `bot_event`, `slack_event`, `sample_team`. All test fixtures are async (`@pytest_asyncio.fixture`).
 - **Theme system**: CSS custom properties in `ui/src/app.css` with `--color-laya-*` brand tokens. Dark/light mode via `data-theme` attribute on `<html>`.
 - **Feed layout**: 3-column flex layout with round-robin card distribution (not CSS columns — intentional, see memory for rationale). `feed/+page.svelte` is decomposed (P7-7): the `card_updated` WS reducer → pure, unit-tested `lib/feed/cardUpdateReducer.ts`; the FLIP animation → `lib/utils/flip.ts` (`capturePositions`/`playFlip`); and the SummaryModal / FilterPopover / RecentDrawer panels → `lib/components/feed/`. Prefer extending those over re-growing the page.
 - **Feed view modes**: `card` | `list` | `timeline` (`lib/stores/feedView.ts`). The **timeline** ("Day Column") view renders the selected day on a clock-time axis: components in `lib/components/feed/timeline/`, pure geometry in `lib/timeline/` (`scale.ts` piecewise axis with collapsible quiet bands, `lanes.ts` packing, `threads.ts` CardGroup→thread mapping) and `lib/utils/threadAttention.ts` (escalation rules), all unit-tested. Its non-negotiable invariant: **a capsule is never moved off its true time to fit** — unplaceable threads go to the overflow strip. It reuses the same `CardGroup` payload and detail panel as the other views; only the raw event volume (heat rail, source-chip counts, meetings) comes from `GET /events/day`. Source-platform and time-of-day-brush filters live in the shared `feedFilters` store, so they apply in all three views.
+- **Omni's first rule — the model decides attention**: in `pipeline/omni.py` the code shapes the model's inputs (base snapshot, new cards incl. delta-chain cards, live state of prior items), validates its output (schema, empty/echo guards) and prunes attention items whose cards are ALL terminal. It never adds an item to attention, promotes one by priority, or restores one the model left out — the feed already sorts by priority; attention is the model's judgement of what the USER has to act on. If attention is wrong, fix `llm/prompts/omni.py` (ATTENTION RULES A1–A6 / E1–E7), not the pipeline.
 - **Comment workarounds and defensive fixes**: Any time a workaround, defensive fix, or non-obvious hack is applied, leave a comment in the code explaining *why* the fix exists and what breaks without it. Future readers (and Claude Code) should understand the reasoning without having to rediscover the problem.
 - **n8n workflow versions**: Every time a bundled workflow JSON in `n8n/workflows/` is modified, bump its `meta.laya_version` field. The engine's startup sync compares this version against deployed records and propagates updates to cloned workflow instances only when the version changes.
+
+## Code comments
+
+Code comments describe the present code: what it does and why, written for a first-time reader of the file. This applies to every comment in any language, file, or repository.
+
+Never write comments that describe development history, such as:
+- Previous approaches or rejected designs
+- What a refactor replaced or improved ("replaces X", "instead of the old Y")
+- Contrasts with code that no longer exists ("no longer re-triggers", "never on consume", "avoids the earlier bug")
+- Decisions or discussion from the session or review that produced the change
+
+Before finalizing a comment, check: would someone who has never seen an earlier version of this code, and wasn't part of the conversation that produced it, fully understand the comment from the current file alone? If not, rewrite it to state the purpose or invariant in present tense against the current code.
+
+Example: a counter that keeps queue consumption from triggering reactivity.
+- Bad: "Only show() writes it, so the effect fires exactly once per queued message and never on consume." ("never on consume" only makes sense against a discarded implementation where consuming was reactive.)
+- Good: "A reactive, monotonic count of queued messages; it decouples the message queue itself from reactivity."
 
 ## Ports
 
@@ -123,9 +146,9 @@ Supporting pipelines (triggered separately):
 
 ## Dependencies
 
-- **Python**: `engine/requirements.txt` (core), `engine/requirements-ml.txt` (optional: torch + sentence-transformers)
+- **Python**: `engine/requirements.txt` (core), `engine/requirements-ml.txt` (optional: torch + sentence-transformers), `engine/requirements-dev.txt` (core + test tools). These are hand-edited version ranges; each has a generated `.lock` (exact pins + hashes, universal across OS/Python 3.10–3.14) and the locks are what gets installed — by first-run setup (`sidecar.rs`, which resolves the `.txt` only if a lock can't be installed on that machine) and by `scripts/setup-dev.sh`. After editing a requirements file run `scripts/lock-deps.sh` (add `--upgrade-package <name>` to move a pin), then `scripts/check-locks.sh` (wheel availability per OS/Python) and `scripts/smoke-install.sh` (fresh venv → import engine → embed → pytest). CI runs the same checks (`.github/workflows/engine-deps.yml`).
 - **Frontend**: `ui/package.json` — Svelte 5, SvelteKit, Skeleton UI, Tailwind v4, Tauri APIs
-- **Rust**: `ui/src-tauri/Cargo.toml` — Tauri v2, tokio, reqwest
+- **Rust**: `ui/src-tauri/Cargo.toml` — Tauri v2, tokio, reqwest. The Tauri crates are pinned to exact versions and `ui/src-tauri/Cargo.lock` is committed (it fixes the transitive crates such as `tauri-runtime`/`wry`/`tao`). Each Tauri crate must share major.minor with its `@tauri-apps/*` package in `ui/package.json` (also exact versions), so bump the crate, the npm package and both lock files together.
 
 ## Other Directories
 

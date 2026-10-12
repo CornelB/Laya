@@ -4,12 +4,15 @@
 	import { onMount } from 'svelte';
 	import { slide } from 'svelte/transition';
 	import { engineApi } from '$lib/api/engine';
+	import { portal } from '$lib/actions/portal';
 	import { glassTheme } from '$lib/stores/glassTheme';
 	import { reducedMotion } from '$lib/stores/reducedMotion';
+	import { parseBackendDate } from '$lib/utils/datetime';
 	import PlatformIcon from './PlatformIcon.svelte';
 	import type {
 		N8nTestResult,
 		N8nBootstrapResponse,
+		N8nAuthStatus,
 		AvailableWorkflow,
 		Source
 	} from '$lib/api/types';
@@ -104,6 +107,23 @@
 		} finally {
 			loadingWorkflows = false;
 		}
+		void loadAuthStatus();
+	}
+
+	// Enforcement state of the token n8n presents to the engine.
+	let authStatus = $state<N8nAuthStatus | null>(null);
+
+	async function loadAuthStatus() {
+		try {
+			authStatus = await engineApi.getN8nAuthStatus();
+		} catch {
+			authStatus = null;
+		}
+	}
+
+	function formatTime(value: string | null | undefined): string {
+		const d = parseBackendDate(value);
+		return d ? d.toLocaleString() : '';
 	}
 
 	async function doBootstrap() {
@@ -250,6 +270,46 @@
 		} finally {
 			togglingWorkflow = null;
 		}
+	}
+
+	// Re-push the bundled template onto a clone flagged with a failed update.
+	let updatingSource = $state<string | null>(null);
+
+	async function updateSourceWorkflow(source: Source) {
+		updatingSource = source.source_id;
+		workflowError = null;
+		try {
+			const refreshed = await engineApi.updateSourceWorkflow(source.source_id);
+			const idx = sources.findIndex((s) => s.source_id === source.source_id);
+			if (idx !== -1) {
+				sources[idx] = refreshed;
+				sources = [...sources];
+			}
+			void loadAuthStatus();
+		} catch (e) {
+			workflowError = e instanceof Error ? e.message : 'Failed to update workflow';
+		} finally {
+			updatingSource = null;
+		}
+	}
+
+	// The workflow tables clip overflow, so the failure tooltip is rendered
+	// through a portal at a fixed position instead of inside the row.
+	let fixedTooltip = $state<{ text: string; top: number; left: number } | null>(null);
+
+	function showUpdateErrorTooltip(e: MouseEvent, source: Source) {
+		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		const failedAt = parseBackendDate(source.workflow_update_failed_at);
+		const when = failedAt ? ` (${failedAt.toLocaleString()})` : '';
+		fixedTooltip = {
+			text: `${source.workflow_update_error ?? 'Update failed'}${when}`,
+			top: rect.bottom + 4,
+			left: rect.left
+		};
+	}
+
+	function hideTooltip() {
+		fixedTooltip = null;
 	}
 
 	// Helpers for workflow display
@@ -422,6 +482,51 @@
 					</a>
 				</div>
 			{/if}
+
+			{#if hasN8nKey && authStatus}
+				<!-- Engine credential: the token n8n presents on the routes its workflows call -->
+				<div class="mt-4 border-t border-surface-700 pt-4">
+					<div class="flex flex-wrap items-center gap-x-4 gap-y-2">
+						<span class="text-laya-secondary font-semibold uppercase tracking-wider text-surface-400">Engine credential</span>
+						<span
+							class="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-laya-micro font-medium
+								{authStatus.mode === 'enforce' ? 'bg-green-900/30 text-green-400' : 'bg-yellow-900/30 text-yellow-300'}"
+							title={authStatus.mode === 'enforce'
+								? `Requests without the token are rejected since ${formatTime(authStatus.enforced_since)}`
+								: 'Requests without the token are logged and accepted until every workflow carries it'}
+						>
+							<span class="h-1.5 w-1.5 rounded-full {authStatus.mode === 'enforce' ? 'bg-green-400' : 'bg-yellow-300'}"></span>
+							{authStatus.mode === 'enforce' ? 'Enforced' : 'Log mode'}
+						</span>
+						<span class="text-laya-secondary text-surface-400">
+							Token from {authStatus.token_source === 'env' ? 'the app' : authStatus.token_source === 'keychain' ? 'the keychain' : authStatus.token_source === 'memory' ? 'this session only' : 'unknown'}
+						</span>
+						<span class="text-laya-secondary {authStatus.rejected_since_start > 0 ? 'text-amber-300' : 'text-surface-400'}">
+							{authStatus.rejected_since_start} request{authStatus.rejected_since_start === 1 ? '' : 's'} without a valid token since start{authStatus.last_rejected_at ? `, last ${formatTime(authStatus.last_rejected_at)}` : ''}
+						</span>
+					</div>
+					{#if authStatus.hatch_active}
+						<p class="mt-2 text-laya-secondary text-amber-300">
+							LAYA_N8N_AUTH=off is set: enforcement is paused for this session.
+						</p>
+					{/if}
+					{#if authStatus.error_handler_update_error}
+						<p class="mt-2 text-laya-secondary text-red-400">
+							Error handler workflow update failed: {authStatus.error_handler_update_error}
+						</p>
+					{/if}
+					{#if authStatus.mode !== 'enforce' && authStatus.unmet.length > 0}
+						<div class="mt-2 text-laya-secondary text-surface-400">
+							<span>Enforcement starts once:</span>
+							<ul class="mt-1 list-disc space-y-0.5 pl-5">
+								{#each authStatus.unmet as reason}
+									<li>{reason}</li>
+								{/each}
+							</ul>
+						</div>
+					{/if}
+				</div>
+			{/if}
 		</div>
 
 		<!-- Section 2: n8n Workflows -->
@@ -498,6 +603,7 @@
 										<th class="px-4 py-2.5">Platform</th>
 										<th class="px-4 py-2.5">Status</th>
 										<th class="px-4 py-2.5">Source</th>
+										<th class="px-4 py-2.5">Actions</th>
 									</tr>
 								</thead>
 								<tbody class="divide-y {$glassTheme ? 'divide-white/[0.06]' : 'divide-surface-700/50'}">
@@ -550,6 +656,36 @@
 												{:else}
 													<span class="text-laya-secondary text-surface-500">—</span>
 												{/if}
+											</td>
+											<td class="px-4 py-3">
+												<!-- The button is always rendered and only enabled while the clone is
+												     flagged, so rows keep the same layout whether or not they need action. -->
+												<div class="flex items-center gap-2">
+													{#if source?.workflow_update_error}
+														<span
+															role="img"
+															class="inline-flex cursor-help text-amber-400"
+															onmouseenter={(e) => showUpdateErrorTooltip(e, source)}
+															onmouseleave={hideTooltip}
+															aria-label={source.workflow_update_error}
+														>
+															<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+																<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+															</svg>
+														</span>
+													{:else}
+														<span class="inline-flex h-4 w-4" aria-hidden="true"></span>
+													{/if}
+													<button
+														onclick={() => source && updateSourceWorkflow(source)}
+														disabled={!source?.workflow_update_error || updatingSource === source?.source_id || n8nHealth === 'unreachable'}
+														class="rounded-md px-2.5 py-1 text-laya-micro font-medium transition-colors disabled:opacity-50
+															{$glassTheme ? 'bg-white/[0.08] text-surface-200 hover:bg-white/[0.14]' : 'bg-surface-700 text-surface-200 hover:bg-surface-600'}"
+														title={source?.workflow_update_error ? 'Re-push the bundled template to this workflow' : 'Workflow is up to date'}
+													>
+														{updatingSource === source?.source_id ? 'Updating…' : 'Update workflow'}
+													</button>
+												</div>
 											</td>
 										</tr>
 									{/each}
@@ -726,4 +862,14 @@
 			{/if}
 		</div>
 	</div>
+{/if}
+
+{#if fixedTooltip}
+	<span
+		use:portal
+		class="pointer-events-none fixed z-[100] max-w-sm rounded-md border border-transparent glass-tooltip px-2 py-1 text-laya-micro font-medium whitespace-normal"
+		style="top: {fixedTooltip.top}px; left: {fixedTooltip.left}px;"
+	>
+		{fixedTooltip.text}
+	</span>
 {/if}

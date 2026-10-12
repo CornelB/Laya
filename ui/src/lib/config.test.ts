@@ -5,6 +5,9 @@ import { describe, it, expect } from 'vitest';
 import {
 	getEngineUrl,
 	getEngineWsUrl,
+	getEngineToken,
+	setEngineToken,
+	waitForEngineToken,
 	CODING_AGENTS,
 	DEFAULT_AGENT_PATHS,
 	AGENT_BINARY_NAMES,
@@ -25,6 +28,54 @@ describe('engine URL helpers', () => {
 		// The regex is anchored (^http) so a host containing "http" would be safe.
 		expect(getEngineWsUrl().startsWith('ws://')).toBe(true);
 		expect(getEngineWsUrl().includes('http')).toBe(false);
+	});
+});
+
+describe('engine auth token helpers', () => {
+	it('returns empty string when no token configured', () => {
+		setEngineToken(null);
+		const win = ((globalThis as any).window ??= {});
+		delete win.__LAYA_ENGINE_TOKEN__;
+		expect(getEngineToken()).toBe('');
+	});
+
+	it('sets and retrieves engine token', () => {
+		setEngineToken('test_token_xyz');
+		expect(getEngineToken()).toBe('test_token_xyz');
+		setEngineToken(null);
+	});
+
+	it('reads the token the shell injects as window.__LAYA_ENGINE_TOKEN__', () => {
+		setEngineToken(null);
+		const win = ((globalThis as any).window ??= {});
+		win.__LAYA_ENGINE_TOKEN__ = 'window_token';
+		expect(getEngineToken()).toBe('window_token');
+		delete win.__LAYA_ENGINE_TOKEN__;
+		setEngineToken(null);
+	});
+
+	it('waitForEngineToken resolves immediately when token exists', async () => {
+		setEngineToken('ready_token');
+		const tok = await waitForEngineToken({ timeoutMs: 100 });
+		expect(tok).toBe('ready_token');
+		setEngineToken(null);
+	});
+
+	it('waitForEngineToken resolves after delayed injection', async () => {
+		setEngineToken(null);
+		setTimeout(() => {
+			setEngineToken('delayed_token');
+		}, 30);
+		const tok = await waitForEngineToken({ intervalMs: 10, timeoutMs: 200 });
+		expect(tok).toBe('delayed_token');
+		setEngineToken(null);
+	});
+
+	it('waitForEngineToken rejects on timeout with clear message', async () => {
+		setEngineToken(null);
+		await expect(waitForEngineToken({ intervalMs: 10, timeoutMs: 50 })).rejects.toThrow(
+			/Engine authentication token was not available within 50ms/
+		);
 	});
 });
 

@@ -398,13 +398,13 @@ async def _exec_run_agent(
         try:
             from laya.agents.entity_context import (
                 build_entity_agent_prompt,
+                build_entity_resume_prompt,
                 get_entity_research_dir,
                 write_entity_context_file,
             )
             from laya.agents import session_manager
             from laya.config import load_repos
-            from laya.workers.engineer import resolve_repo_path
-            from laya.models.classification import Category, Persona, Priority, RouterOutput as RO
+            from laya.workers.engineer import resolve_entity_repo_path
             from laya.api.cards_api import _stream_entity_agent
             from laya.tasks import create_task as create_tracked_task
 
@@ -439,8 +439,9 @@ async def _exec_run_agent(
             await write_entity_context_file(entity_id, space_id)
             research_dir_str = str(get_entity_research_dir(entity_id))
 
-            dummy_router = RO(persona=Persona.ENGINEER, priority=Priority.MEDIUM, category=Category.CODE, confidence=0.8, entities=[])
-            repo_path, other_repos = await resolve_repo_path(dummy_router, space_id=space_id)
+            # Resolve the repo from every event in the entity group (persisted
+            # classification + payload), mirroring cards_agent.run_entity_agent.
+            repo_path, other_repos = await resolve_entity_repo_path(entity_id, space_id=space_id)
 
             if repo_path:
                 cwd = repo_path
@@ -459,9 +460,8 @@ async def _exec_run_agent(
             if existing:
                 # Resume the same session (reuses session_id, so the Workspace
                 # button keeps opening the workspace the user already had).
-                resume_text = prompt or "Continue working. Check CONTEXT.md for updated entity context."
                 agent = await session_manager.resume_conversation(
-                    existing["session_id"], resume_text, add_dirs=add_dirs,
+                    existing["session_id"], build_entity_resume_prompt(prompt), add_dirs=add_dirs,
                 )
                 session_id = existing["session_id"]
             else:

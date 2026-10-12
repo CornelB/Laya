@@ -731,9 +731,14 @@ fn spawn_n8n() -> Result<Child, String> {
         .env("N8N_USER_FOLDER", data_dir.to_string_lossy().as_ref())
         .env("N8N_PORT", N8N_PORT.to_string())
         .env("N8N_HOST", "127.0.0.1")
+        // N8N_HOST only sets the host n8n reports in URLs; the bind address
+        // is N8N_LISTEN_ADDRESS, which defaults to "::" (every interface).
+        // Bind loopback only so the editor, REST API and webhooks are not
+        // reachable from the LAN.
+        .env("N8N_LISTEN_ADDRESS", "127.0.0.1")
         .env(
             "WEBHOOK_URL",
-            format!("http://localhost:{}/", N8N_PORT),
+            format!("http://127.0.0.1:{}/", N8N_PORT),
         )
         .env("N8N_SECURE_COOKIE", "false")
         .env("N8N_PUBLIC_API_DISABLED", "false")
@@ -754,6 +759,13 @@ fn spawn_n8n() -> Result<Child, String> {
         .env("LAYA_ENGINE_URL", format!("http://127.0.0.1:{}", std::env::var("LAYA_ENGINE_PORT").unwrap_or_else(|_| "8420".to_string())))
         // n8n 2.x blocks $env access in workflow expressions by default
         .env("N8N_BLOCK_ENV_ACCESS_IN_NODE", "false")
+        // The bundled workflows read this with `$env.LAYA_N8N_TOKEN` and send
+        // it as the X-Laya-N8n-Token header on every call to the engine.
+        .env(crate::N8N_TOKEN_ENV, crate::n8n_token())
+        // Workflow expressions can read n8n's environment (see above), so the
+        // engine API token must not be in it. It is only present in the shell's
+        // own environment when a developer presets it for a dev build.
+        .env_remove(crate::ENGINE_TOKEN_ENV)
         // Pipe stdout/stderr so pipe_to_rotating() can capture them into a
         // size-capped, rotating n8n.log (see below).
         .stdout(Stdio::piped())

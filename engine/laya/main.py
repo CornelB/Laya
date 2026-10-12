@@ -12,11 +12,13 @@ from contextlib import asynccontextmanager
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
+
+from laya.security.origin_guard import ALLOWED_ORIGINS, origin_is_allowed
 
 from laya.agents import session_manager
 from laya.api.actions_api import router as actions_router
@@ -53,7 +55,7 @@ from laya.api.ws_router import handle_ws_message
 from laya.config import ENGINE_HOST, ENGINE_PORT, ensure_directories, load_repos, load_rules, load_settings, load_team
 from laya.http_client import close_client as close_http_client
 from laya.integrations.n8n_bootstrap import provision_n8n_background, sync_workflows_background
-from laya.db.chromadb_store import connect_chromadb, disconnect_chromadb
+from laya.db.chromadb_store import connect_chromadb_background, disconnect_chromadb
 from laya.db.fts import ensure_fts_tables
 from laya.db.migrate import run_migrations
 from laya.db.sqlite import connect, disconnect
@@ -61,7 +63,8 @@ from laya.logging_setup import resolve_log_level, setup_logging
 from laya.pipeline.omni import start_omni_processor, stop_omni_processor
 from laya.pipeline.queue import recover_stalled_cards, recover_stalled_events, start_consumer, stop_consumer
 from laya.scheduler import start_scheduler, stop_scheduler
-from laya.security.keychain import load_all_keys_to_env
+from laya.security.engine_auth import require_engine_auth
+from laya.security.keychain import ensure_engine_token, ensure_n8n_token, load_all_keys_to_env
 
 log = structlog.get_logger()
 
@@ -255,6 +258,19 @@ async def lifespan(app: FastAPI):
     # Load API keys from OS keychain into environment
     load_all_keys_to_env()
 
+    # Resolve the engine API token (launcher-supplied env var, else keychain)
+    ensure_engine_token()
+
+    # Resolve the token the bundled n8n workflows present (same resolution),
+    # then see whether it can be enforced already (fresh installs can; an
+    # upgraded install waits for the startup workflow sync to push the header).
+    ensure_n8n_token()
+    try:
+        from laya.security.n8n_auth import evaluate_readiness
+        await evaluate_readiness()
+    except Exception as e:
+        log.warning("n8n_auth_readiness_check_failed", error=str(e))
+
     # Ensure an MCP bearer token exists when auth_mode=bearer so the SSE
     # endpoint is immediately usable. Token only generated if missing.
     ensure_mcp_startup_token()
@@ -290,8 +306,11 @@ async def lifespan(app: FastAPI):
     # 10 min so a slow-starting n8n is handled gracefully.
     _workflow_sync_task = create_tracked_task(sync_workflows_background())  # noqa: F841
 
-    # Connect ChromaDB vector store
-    connect_chromadb()
+    # Connect ChromaDB vector store in the background, for the same reason as
+    # n8n provisioning above: it imports torch/transformers, which took ~108s
+    # on a cold first launch (#24). The async store functions wait for it, so
+    # events consumed meanwhile are still indexed once it is ready.
+    create_tracked_task(connect_chromadb_background())
 
     # Start briefing scheduler
     start_scheduler()
@@ -425,17 +444,35 @@ app.add_middleware(
     CORSMiddleware,
     # Windows Tauri v2 serves the bundled frontend from http(s)://tauri.localhost/;
     # macOS/Linux use tauri://localhost. Both origins must be allowed so fetch()
-    # from the webview (e.g. health polling) isn't blocked by the browser.
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "tauri://localhost",
-        "http://tauri.localhost",
-        "https://tauri.localhost",
-    ],
+    # from the webview (e.g. health polling) isn't blocked by the browser. The list
+    # is the shared one: this used to be a second copy of it, and a list that lives
+    # in three places drifts.
+    allow_origins=sorted(ALLOWED_ORIGINS),
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _reject_cross_site_origin(request: Request, call_next):
+    """Refuse a browser request whose Origin is not the app's own.
+
+    The MCP token routes already did this for themselves; doing it per-endpoint
+    left every other router open, and a route added tomorrow would inherit nothing.
+    Middleware cannot be forgotten (#13).
+
+    A missing Origin passes: n8n, curl and the external MCP clients are not
+    browsers. That leaves the same-user-process case, which needs the token half of
+    #13 — see `laya/security/origin_guard.py` for why that is a separate problem.
+    """
+    origin = request.headers.get("origin")
+    if not origin_is_allowed(origin):
+        log.warning("cross_site_request_blocked", origin=origin, path=request.url.path)
+        return JSONResponse(
+            {"detail": "cross-site origin not allowed"},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+    return await call_next(request)
 
 
 @app.exception_handler(RequestValidationError)
@@ -466,37 +503,49 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # Register REST routers
-app.include_router(actions_router)
-app.include_router(audit_router)
-app.include_router(budget_router)
-app.include_router(cards_router)
-app.include_router(classification_router)
-app.include_router(connections_router)
-app.include_router(context_rules_router)
-app.include_router(egress_router)
-app.include_router(chat_router)
-app.include_router(dashboard_router)
-app.include_router(diagnostics_router)
-app.include_router(events_router)
-app.include_router(health_router)
-app.include_router(ingestion_errors_router)
-app.include_router(mcp_router)
-app.include_router(metadata_router)
-app.include_router(omni_router)
-app.include_router(team_router)
-app.include_router(processing_rules_router)
-app.include_router(rules_router)
-app.include_router(settings_router)
-app.include_router(spaces_router)
-app.include_router(tags_router)
-app.include_router(trace_router)
-app.include_router(workspace_router)
+auth_deps = [Depends(require_engine_auth)]
+
+app.include_router(actions_router, dependencies=auth_deps)
+app.include_router(audit_router, dependencies=auth_deps)
+app.include_router(budget_router, dependencies=auth_deps)
+app.include_router(cards_router, dependencies=auth_deps)
+app.include_router(classification_router, dependencies=auth_deps)
+app.include_router(connections_router, dependencies=auth_deps)
+app.include_router(context_rules_router, dependencies=auth_deps)
+app.include_router(egress_router, dependencies=auth_deps)
+app.include_router(chat_router, dependencies=auth_deps)
+app.include_router(dashboard_router, dependencies=auth_deps)
+app.include_router(diagnostics_router, dependencies=auth_deps)
+app.include_router(events_router, dependencies=auth_deps)
+app.include_router(health_router)  # Exempt: health check must be reachable anonymously
+app.include_router(ingestion_errors_router, dependencies=auth_deps)
+app.include_router(mcp_router, dependencies=auth_deps)
+app.include_router(metadata_router, dependencies=auth_deps)
+app.include_router(omni_router, dependencies=auth_deps)
+app.include_router(team_router, dependencies=auth_deps)
+app.include_router(processing_rules_router, dependencies=auth_deps)
+app.include_router(rules_router, dependencies=auth_deps)
+app.include_router(settings_router, dependencies=auth_deps)
+app.include_router(spaces_router, dependencies=auth_deps)
+app.include_router(tags_router, dependencies=auth_deps)
+app.include_router(trace_router, dependencies=auth_deps)
+app.include_router(workspace_router, dependencies=auth_deps)
 register_mcp_transport(app)
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time UI communication."""
+    # Checked here rather than in the middleware above: Starlette's http middleware
+    # never sees a WebSocket scope, and CORS does not apply to a handshake — so
+    # without this any page could subscribe to the card-update broadcast and send
+    # the app's own UI messages. Closing before `accept()` refuses the handshake;
+    # 1008 is "policy violation".
+    origin = websocket.headers.get("origin")
+    if not origin_is_allowed(origin):
+        log.warning("cross_site_websocket_blocked", origin=origin)
+        await websocket.close(code=1008)
+        return
     await manager.connect(websocket)
     from laya.tasks import create_task as create_tracked_task
     try:

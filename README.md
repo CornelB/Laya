@@ -1,4 +1,5 @@
 # Laya: Your AI Command Center
+https://laya.aay.sh
 
 ![Demo](./laya.gif)
 
@@ -101,8 +102,9 @@ laya/
 │   │   ├── egress/          # Outbound action execution (9 platforms)
 │   │   ├── integrations/    # n8n bootstrap & client
 │   │   └── security/        # OS keychain integration
-│   ├── requirements.txt     # Core Python dependencies
-│   └── requirements-ml.txt  # Optional: torch + sentence-transformers
+│   ├── requirements.txt     # Core Python dependencies (version ranges)
+│   ├── requirements-ml.txt  # Optional: torch + sentence-transformers
+│   └── requirements*.lock   # Exact pinned versions that get installed
 │
 ├── ui/                      # SvelteKit + Tauri desktop app
 │   ├── src/                 # Svelte 5 frontend (runes syntax)
@@ -201,6 +203,15 @@ sudo apt install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-
 ```
 
 ### Troubleshooting
+
+<details>
+<summary><strong>Ingestion stopped and the engine log shows <code>n8n_auth_missing</code> with <code>rejected=True</code></strong></summary>
+
+The engine is enforcing the n8n token (see "Engine API authentication") and a workflow is calling it without one. Open **Settings → Integrations → n8n**: a workflow row with a warning icon failed to take the latest template; press **Update workflow** on it. If n8n was started by hand, make sure it has the same `LAYA_N8N_TOKEN` as the engine.
+
+To get ingestion flowing again before fixing the cause, start the engine with `LAYA_N8N_AUTH=off`. That pauses enforcement for that run only; editing `n8n_auth.mode` in `settings.json` back to `log` does not stick, because the engine re-enables enforcement as soon as every workflow is up to date.
+
+</details>
 
 <details>
 <summary><strong>Linux: Tailwind CSS classes missing or styles not updating</strong></summary>
@@ -345,6 +356,40 @@ n8n is managed automatically by the Tauri app -- it starts on launch (port 45678
 
 > **Note:** If the engine fails with "Address already in use", a stale engine process may be holding port 8420. The engine will attempt to kill it automatically on startup.
 
+### Engine API authentication
+
+The engine's REST API requires an `Authorization: Bearer <token>` header on every route except `GET /health`. The Laya app handles this by itself: on each launch it generates a new token, shares it with the engine, and uses it for all of its own requests. There is nothing to configure for normal use, and the token is kept in memory only.
+
+**Running the UI in a plain browser.** When you open `http://localhost:5173` in a browser there is no Tauri window to supply the token, so give the engine and the UI the same value yourself:
+
+```bash
+# ui/.env.local (gitignored)
+VITE_LAYA_ENGINE_TOKEN=<token>
+
+# Standalone engine + Vite dev server
+cd engine && source .venv/bin/activate && LAYA_ENGINE_TOKEN=<token> python -m laya.main
+cd ui && npm run dev
+
+# Or: the Tauri window and a browser tab side by side (dev builds only)
+LAYA_ENGINE_TOKEN=<token> scripts/dev.sh
+```
+
+Vite reads `.env.local` when it starts, so restart `npm run dev` after changing the token. Release builds ignore a preset `LAYA_ENGINE_TOKEN` and always generate their own. If the UI cannot find a token, the startup screen says so.
+
+**Calling the API by hand.** Start the engine with a known `LAYA_ENGINE_TOKEN` as above and send it as a bearer header:
+
+```bash
+curl -H "Authorization: Bearer $LAYA_ENGINE_TOKEN" http://127.0.0.1:8420/settings
+```
+
+A standalone engine started without `LAYA_ENGINE_TOKEN` creates a token and stores it in the OS keychain (service `laya-engine`, account `laya_engine_api_token`).
+
+**The n8n token.** The bundled n8n workflows use a second, separate token, `LAYA_N8N_TOKEN`, sent as the `X-Laya-N8n-Token` header. It is accepted only on the four routes the workflows call (`POST /events`, `POST /ingestion-errors`, `GET /repos`, `GET /metadata/{key}`), which also accept the app token; it opens nothing else. The app generates it per launch and sets the same variable on the engine and on n8n. When you run the engine or n8n by hand, set `LAYA_N8N_TOKEN` to the same value on both (n8n reads it with `$env.LAYA_N8N_TOKEN`; the engine stores a keychain token under `laya_n8n_token` if the variable is absent, but n8n will not know that value).
+
+Enforcement is staged so an upgrade cannot drop events: the engine runs in **log mode** (requests without the token are logged and accepted) until the startup workflow sync has pushed the header-sending template to every cloned workflow and the error handler, then switches to **enforce** and stays there. Settings → Integrations → n8n shows the mode, what is still blocking enforcement, and how many requests arrived without a valid token.
+
+The OAuth redirect callback accepts requests without a token. The WebSocket at `/ws` is not authenticated yet.
+
 ### Configuration
 
 On first launch, the engine creates config files in `~/.laya/`:
@@ -372,14 +417,17 @@ vim ~/.laya/prompts/router.md
 
 # Override a worker persona
 vim ~/.laya/prompts/engineer.md
+```
 
-# Reload without restarting
-curl -X POST http://127.0.0.1:8420/prompts/reload
+Apply changes without restarting from **Settings → Models → Custom Prompts → Reload prompts**, which also lists the prompt files currently in use. From a terminal, the same reload needs the engine token (see "Engine API authentication"):
+
+```bash
+curl -X POST -H "Authorization: Bearer $LAYA_ENGINE_TOKEN" http://127.0.0.1:8420/prompts/reload
 ```
 
 Available prompt files: `router.md`, `stager.md`, `omni.md`, `group_summary_initial.md`, `group_summary_rolling.md`, `briefing.md`, `summarizer.md`, `summarizer_status_change.md`, `engineer.md`, `comms.md`, `sales.md`, `hr.md`, `ops.md`, `finance.md`, `chat.md`, `chat_title.md`, `chat_polish.md`, `learner.md`, `context_learner.md`, `trace_narrative.md`, `trace_summary.md`, `trace_filter.md`.
 
-Custom prompts fully replace the built-in default for that stage. If a file is deleted, the hardcoded default is used automatically. The engine never creates or modifies files in this directory. Use `GET /prompts` to check which prompts are currently overridden.
+Custom prompts fully replace the built-in default for that stage. If a file is deleted, the hardcoded default is used automatically. The engine never creates or modifies files in this directory. Use `GET /prompts` (with the same bearer header) to check which prompts are currently overridden.
 
 ### Data Storage
 
@@ -402,7 +450,7 @@ scripts/build.sh
 
 This does two things:
 
-1. **Bundles engine source** -- copies `engine/laya/`, `requirements.txt`, `requirements-ml.txt`, and `n8n/workflows/` into `ui/src-tauri/resources/engine/`
+1. **Bundles engine source** -- copies `engine/laya/`, the requirements files and their lock files, and `n8n/workflows/` into `ui/src-tauri/resources/engine/`
 2. **Builds the Tauri app** -- compiles the Rust shell, bundles the SvelteKit frontend, and packages everything into a platform-native installer
 
 ### Build Options

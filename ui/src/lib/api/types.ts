@@ -13,7 +13,7 @@ export interface EmbeddingInfo {
 export interface HealthResponse {
 	engine: string;
 	sqlite: string;
-	chromadb?: string;
+	chromadb?: string; // "healthy" | "starting" | "unhealthy"
 	n8n: string;
 	uptime_seconds: number;
 	embeddings?: EmbeddingInfo;
@@ -1022,6 +1022,20 @@ export interface N8nBootstrapResponse {
 	has_api_key: boolean;
 }
 
+/** GET /settings/n8n/auth-status: enforcement of the token n8n presents to the engine */
+export interface N8nAuthStatus {
+	mode: 'log' | 'enforce';
+	enforced_since: string | null;
+	hatch_active: boolean;
+	token_source: 'env' | 'keychain' | 'memory' | null;
+	rejected_since_start: number;
+	last_rejected_at: string | null;
+	/** Human-readable conditions still blocking enforcement; empty when enforced. */
+	unmet: string[];
+	error_handler_update_error: string | null;
+	flagged_clones: number;
+}
+
 /** Platforms registry response */
 export interface PlatformsResponse {
 	platforms: Record<string, PlatformConfig>;
@@ -1096,6 +1110,9 @@ export interface Source {
 	source_type?: string;
 	webhook_path?: string;
 	created_at?: string;
+	/** Last failed push of the bundled template to this clone; null when up to date. */
+	workflow_update_error?: string | null;
+	workflow_update_failed_at?: string | null;
 }
 
 /** Available n8n workflow for source assignment */
@@ -1476,38 +1493,48 @@ export type OmniSectionType = 'attention' | 'recent' | 'period' | 'milestone';
 
 // --- Change summaries (the "What changed" rail + funnel fold annotations) ---
 
-export interface OmniChangeAdded {
+/** Fields GET /omni/changes stamps while merging a version range. Absent on the
+ *  summary embedded in snapshot rows. */
+interface OmniChangeRangeMeta {
+	/** Version of the write that recorded this entry. */
+	version?: number;
+	/** True when the item did not exist at the comparison base — its first
+	 *  recorded event inside the range was an `added` entry. */
+	entered_in_range?: boolean;
+}
+
+export interface OmniChangeAdded extends OmniChangeRangeMeta {
 	item_key: string;
 	section: OmniSectionType;
 	text: string;
 	source_count: number;
 	platforms: string[];
-	/** Version of the write that recorded this entry. Stamped by GET
-	 *  /omni/changes only — absent on the summary embedded in snapshot rows. */
-	version?: number;
+	/** Set when the item moved here from a LATER section (recent → attention)
+	 *  rather than appearing for the first time. */
+	promoted_from?: OmniSectionType;
 }
 
-export interface OmniChangeFolded {
+export interface OmniChangeFolded extends OmniChangeRangeMeta {
 	item_key: string;
 	from_section: OmniSectionType;
 	/** null = dropped by compression rather than promoted to a later layer. */
 	to_section: OmniSectionType | null;
 	from_text: string;
 	to_text: string | null;
-	/** Version of the write that recorded this entry. Stamped by GET
-	 *  /omni/changes only — absent on the summary embedded in snapshot rows. */
-	version?: number;
 }
 
-export interface OmniChangeResolved {
+export interface OmniChangeResolved extends OmniChangeRangeMeta {
 	item_key: string;
 	section: OmniSectionType;
 	text: string;
 	entity_ids: string[];
 	resolved_at: string | null;
-	/** Version of the write that recorded this entry. Stamped by GET
-	 *  /omni/changes only — absent on the summary embedded in snapshot rows. */
-	version?: number;
+	/** Why an attention item left, when the synthesis declared it rather than
+	 *  the cards resolving: superseded, obsolete, handed_off, user_acted,
+	 *  expired, deprioritised, resolved or other. */
+	reason?: string;
+	/** One clause of evidence for `reason`, as the synthesis wrote it. */
+	note?: string;
 }
 
 export interface OmniChangeSummary {

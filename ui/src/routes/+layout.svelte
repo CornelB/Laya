@@ -13,8 +13,8 @@
 	import { chatOpen, chatListOpen } from '$lib/stores/chat';
 	import { initChatStream } from '$lib/stores/chatStream';
 	import { theme } from '$lib/stores/theme';
-	import { getEngineUrl } from '$lib/config';
 	import { fontScale } from '$lib/stores/fontScale';
+	import { engineApi } from '$lib/api/engine';
 	import { systemFont } from '$lib/stores/systemFont';
 	import { accessibleColors } from '$lib/stores/accessibleColors';
 	import { reducedMotion } from '$lib/stores/reducedMotion';
@@ -37,6 +37,7 @@
 	import { triggerSearchFocus } from '$lib/stores/searchFocus';
 	import RunAgentModal from '$lib/components/agent/RunAgentModal.svelte';
 	import UpdateBanner from '$lib/components/UpdateBanner.svelte';
+	import VectorStoreBanner from '$lib/components/VectorStoreBanner.svelte';
 	import Titlebar from '$lib/components/Titlebar.svelte';
 	import { startPeriodicCheck, stopPeriodicCheck } from '$lib/stores/updater';
 	import { onMount } from 'svelte';
@@ -223,8 +224,8 @@
 	$effect(() => {
 		if (!$startupReady || setupChecked || isSetupRoute) return;
 		setupChecked = true;
-		fetch(`${getEngineUrl()}/settings/setup-status`)
-			.then((resp) => resp.ok ? resp.json() : null)
+		engineApi
+			.getSetupStatus()
 			.then((data) => {
 				if (data && !data.setup_complete) goto('/setup');
 			})
@@ -821,6 +822,9 @@
 				<a href="/settings?tab=models&section=agent-usage" class="ml-1 text-xs font-medium text-red-400 underline underline-offset-2 hover:text-red-300">Manage</a>
 			</div>
 		{/if}
+
+		<!-- Vector store setup / unavailable banner -->
+		<VectorStoreBanner />
 
 		<!-- Update available banner -->
 		<UpdateBanner />
